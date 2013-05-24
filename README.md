@@ -1,0 +1,4 @@
+pipes-crypto
+============
+
+Cryptographic pipes

@@ -14,6 +14,7 @@ import Data.ByteString (ByteString)
 import Data.Monoid
 import Data.Word ()
 
+
 --------------------------------------------------------------------------------
 import qualified Crypto.Classes as Crypto
 import qualified Crypto.HMAC as Crypto
@@ -23,6 +24,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Serialize as S
 import qualified Data.Tagged as Tagged
+
 
 --------------------------------------------------------------------------------
 -- | Hash the content flowing downstream in a 'Pipes.Proxy'.
@@ -55,51 +57,37 @@ hashD source = wrapD source >-> streamingHash
 
 
 --------------------------------------------------------------------------------
--- | Hash the content flowing downstream in a 'Pipes.Proxy'.
-hmacD :: forall ctx p m d a' a. (Monad m, Crypto.Hash ctx d, Pipes.Proxy p) =>
+-- | Calculate the HMAC of all values flowing downstream, for a given
+-- 'Crypto.MacKey'.
+hmacD :: forall ctx p m d a' a.
+  (Monad m, Crypto.Hash ctx d, Pipes.Proxy p, Monad (p a' a () ByteString m)) =>
     Crypto.MacKey ctx d -> (() -> p a' a () ByteString m ()) ->
     () -> p a' a () d m ()
-hmacD (Crypto.MacKey key) source = wrapD source >-> streamingHmac
+hmacD (Crypto.MacKey key) source =
+    hashD (\x -> Pipes.respond kI >> source x) >->
+    const (Pipes.runIdentityP $ do
+             inner :: d <- Pipes.request ()
+             Pipes.respond . Crypto.hash . LBS.fromChunks $
+               [ kO, S.encode inner ])
 
   where
 
-    streamingHmac = const $
-        State.evalStateP kI $ go (Crypto.initialCtx :: ctx)
+    cap k = if BS.length k > blockSize
+              then S.encode (Crypto.hash' k :: d)
+              else k
 
-      where
+    pad k = let remaining = blockSize - BS.length k
+            in if remaining > 0
+              then k `BS.append` BS.replicate remaining 0x00
+              else k
 
-        cap k = if BS.length k > blockSize
-                  then S.encode (Crypto.hash' k :: d)
-                  else k
+    blockSize = (Crypto.blockLength `Tagged.witness` (undefined :: d)) `div` 8
 
-        pad k = let remaining = blockSize - BS.length k
-                in if remaining > 0
-                  then k `BS.append` (BS.replicate remaining 0x00)
-                  else k
+    key' = pad . cap $ key
 
-        blockSize = (Crypto.blockLength `Tagged.witness` (undefined :: d)) `div` 8
+    kO = BS.map (`xor` 0x5c) key'
 
-        key' = pad . cap $ key
-
-        kO = BS.map (`xor` 0x5c) key'
-
-        kI = BS.map (`xor` 0x36) key'
-
-        go !ctx = do
-            res <- Pipes.request ()
-            case res of
-                Just a -> do
-                    allData <- BS.append <$> State.get <*> pure a
-                    let blocks = floor (fromIntegral (BS.length allData) /
-                                        fromIntegral blockSize :: Float)
-                        (consumed, leftOver) = BS.splitAt (blocks * blockSize) allData
-                    State.put leftOver
-                    go (Crypto.updateCtx ctx consumed)
-                Nothing -> do
-                    leftOver <- State.get
-                    let inner = Crypto.finalize ctx leftOver
-                    Pipes.respond . Crypto.hash . LBS.fromChunks $
-                        [ kO, S.encode inner ]
+    kI = BS.map (`xor` 0x36) key'
 
 
 --------------------------------------------------------------------------------

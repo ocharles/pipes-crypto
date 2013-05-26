@@ -3,10 +3,12 @@
 module Control.Proxy.Crypto
     ( hashD
     , hmacD
+    , ecbD
     ) where
 
 --------------------------------------------------------------------------------
 import Control.Applicative
+import Control.Monad (when)
 import Control.Proxy ((>->))
 import Data.Bits (xor)
 import Data.ByteString (ByteString)
@@ -32,18 +34,19 @@ hashD () = State.evalStateP mempty $ go (Crypto.initialCtx :: ctx)
 
   where
 
-    blockSize = Crypto.blockLength `Tagged.witness` (undefined :: d)
+    blockSize =
+        Crypto.blockLength `Tagged.witness` (undefined :: d) `div` 8
 
     go !ctx = do
         res <- Pipes.request ()
         case res of
             Just a -> do
-                allData <- BS.append <$> State.get <*> pure a
-                let blocks = floor (fromIntegral (BS.length allData) /
-                                    fromIntegral blockSize :: Float)
-                    (consumed, leftOver) = BS.splitAt (blocks * blockSize) allData
-                State.put leftOver
-                go (Crypto.updateCtx ctx consumed)
+                consumed <- getBlocks a blockSize
+
+                if not . BS.null $ consumed
+                    then go (Crypto.updateCtx ctx consumed)
+                    else go ctx
+
             Nothing -> do
                 leftOver <- State.get
                 return $ Crypto.finalize ctx leftOver
@@ -73,11 +76,44 @@ hmacD (Crypto.MacKey key) () = Pipes.runIdentityP $ do
               then k `BS.append` BS.replicate remaining 0x00
               else k
 
-    blockSize = (Crypto.blockLength `Tagged.witness` (undefined :: d)) `div` 8
+    blockSize = (Crypto.blockLength `Tagged.witness`
+                    (undefined :: d)) `div` 8
 
     key' = pad . cap $ key
 
     kO = BS.map (`xor` 0x5c) key'
 
     kI = BS.map (`xor` 0x36) key'
+
+--------------------------------------------------------------------------------
+ecbD :: forall m k p. (Monad m, Crypto.BlockCipher k, Pipes.Proxy p) =>
+    k -> () -> p () ByteString () ByteString m ()
+ecbD k () = State.evalStateP mempty go
+
+  where
+
+    blockSize = Crypto.blockSize `Tagged.witness` (undefined :: k) `div` 8
+
+    go = Pipes.request () >>= ecb
+
+    ecb x = do
+        consumed <- getBlocks x blockSize
+        when (not . BS.null $ consumed) $ Pipes.respond (Crypto.ecb k x)
+        go
+
+
+--------------------------------------------------------------------------------
+getBlocks :: (Monad m, Pipes.Proxy p) =>
+    ByteString -> Int -> State.StateP ByteString p a' a b' b m ByteString
+getBlocks a n = do
+    allData <- BS.append <$> State.get <*> pure a
+
+    let blocks = floor (fromIntegral (BS.length allData) /
+                        fromIntegral n :: Float)
+
+        (consumed, leftOver) = BS.splitAt (blocks * n) allData
+
+    State.put leftOver
+
+    return consumed
 

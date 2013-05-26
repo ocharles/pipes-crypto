@@ -7,8 +7,7 @@ module Control.Proxy.Crypto
 
 --------------------------------------------------------------------------------
 import Control.Applicative
-import Control.Monad (forever)
-import Control.Proxy ((>>~), (>->))
+import Control.Proxy ((>->))
 import Data.Bits (xor)
 import Data.ByteString (ByteString)
 import Data.Monoid
@@ -25,52 +24,45 @@ import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Serialize as S
 import qualified Data.Tagged as Tagged
 
-
 --------------------------------------------------------------------------------
 -- | Hash the content flowing downstream in a 'Pipes.Proxy'.
-hashD :: forall ctx p m d a' a. (Monad m, Crypto.Hash ctx d, Pipes.Proxy p) =>
-    (() -> p a' a () ByteString m ()) -> () -> p a' a () d m ()
-hashD source = wrapD source >-> streamingHash
+hashD :: forall ctx p m d y' y. (Monad m, Crypto.Hash ctx d, Pipes.Proxy p) =>
+    () -> p () (Maybe ByteString) y' y m d
+hashD () = State.evalStateP mempty $ go (Crypto.initialCtx :: ctx)
 
   where
 
-    streamingHash = const $
-        State.evalStateP mempty $ go (Crypto.initialCtx :: ctx)
+    blockSize = Crypto.blockLength `Tagged.witness` (undefined :: d)
 
-      where
-
-        blockSize = Crypto.blockLength `Tagged.witness` (undefined :: d)
-
-        go !ctx = do
-            res <- Pipes.request ()
-            case res of
-                Just a -> do
-                    allData <- BS.append <$> State.get <*> pure a
-                    let blocks = floor (fromIntegral (BS.length allData) /
-                                        fromIntegral blockSize :: Float)
-                        (consumed, leftOver) = BS.splitAt (blocks * blockSize) allData
-                    State.put leftOver
-                    go (Crypto.updateCtx ctx consumed)
-                Nothing -> do
-                    leftOver <- State.get
-                    Pipes.respond $ Crypto.finalize ctx leftOver
+    go !ctx = do
+        res <- Pipes.request ()
+        case res of
+            Just a -> do
+                allData <- BS.append <$> State.get <*> pure a
+                let blocks = floor (fromIntegral (BS.length allData) /
+                                    fromIntegral blockSize :: Float)
+                    (consumed, leftOver) = BS.splitAt (blocks * blockSize) allData
+                State.put leftOver
+                go (Crypto.updateCtx ctx consumed)
+            Nothing -> do
+                leftOver <- State.get
+                return $ Crypto.finalize ctx leftOver
 
 
 --------------------------------------------------------------------------------
 -- | Calculate the HMAC of all values flowing downstream, for a given
 -- 'Crypto.MacKey'.
-hmacD :: forall ctx p m d a' a.
-  (Monad m, Crypto.Hash ctx d, Pipes.Proxy p, Monad (p a' a () ByteString m)) =>
-    Crypto.MacKey ctx d -> (() -> p a' a () ByteString m ()) ->
-    () -> p a' a () d m ()
-hmacD (Crypto.MacKey key) source =
-    hashD (\x -> Pipes.respond kI >> source x) >->
-    const (Pipes.runIdentityP $ do
-             inner :: d <- Pipes.request ()
-             Pipes.respond . Crypto.hash . LBS.fromChunks $
-               [ kO, S.encode inner ])
+hmacD :: forall ctx p m d y' y.
+  (Monad m, Crypto.Hash ctx d, Pipes.Proxy p) =>
+    Crypto.MacKey ctx d -> () -> p () (Maybe ByteString) y' y m d
+hmacD (Crypto.MacKey key) () = Pipes.runIdentityP $ do
+    h <- (prefix kI >-> hashD) ()
+    return . Crypto.hash . LBS.fromChunks $
+        [ kO, S.encode (h :: d) ]
 
   where
+
+    prefix x () = Pipes.respond (Just x) >>= Pipes.pull
 
     cap k = if BS.length k > blockSize
               then S.encode (Crypto.hash' k :: d)
@@ -89,16 +81,3 @@ hmacD (Crypto.MacKey key) source =
 
     kI = BS.map (`xor` 0x36) key'
 
-
---------------------------------------------------------------------------------
-wrapD :: (Monad m, Pipes.Proxy p) =>
-    (b' -> p a' a b' b m r) -> b' -> p a' a b' (Maybe b) m r
-wrapD source = only . source
-  where
-    only p = Pipes.runIdentityP $ do
-        Pipes.IdentityP p >>~ wrap
-        forever $ Pipes.respond Nothing
-    wrap a = do
-        a' <- Pipes.respond (Just a)
-        a2 <- Pipes.request a'
-        wrap a2
